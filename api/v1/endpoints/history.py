@@ -28,11 +28,24 @@ from api.v1.schemas.history import (
     ReportStrategy,
     ReportDetails,
     MarkdownReportResponse,
+    RunDiagnosticSummaryResponse,
 )
 from api.v1.schemas.common import ErrorResponse
 from src.storage import DatabaseManager
+from src.report_language import (
+    get_sentiment_label,
+    get_localized_stock_name,
+    localize_operation_advice,
+    localize_trend_prediction,
+    normalize_report_language,
+)
 from src.services.history_service import HistoryService, MarkdownReportGenerationError
-from src.utils.data_processing import normalize_model_used, extract_fundamental_detail_fields
+from src.utils.data_processing import (
+    normalize_model_used,
+    extract_fundamental_detail_fields,
+    extract_board_detail_fields,
+    extract_realtime_detail_fields,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -210,29 +223,39 @@ def get_history_detail(
             )
         
         # 从 context_snapshot 中提取价格信息
-        current_price = None
-        change_pct = None
+        # 注意：使用 `is None` 而非 `or`，避免把 0.0（平盘）误判为缺失值；
+        # 同时不混用 `change_60d`（60 日累计涨跌幅）作为日内 change_pct 的兜底。
         context_snapshot = result.get("context_snapshot")
-        if context_snapshot and isinstance(context_snapshot, dict):
-            # 尝试从 enhanced_context.realtime 获取
-            enhanced_context = context_snapshot.get("enhanced_context") or {}
-            realtime = enhanced_context.get("realtime") or {}
-            current_price = realtime.get("price")
-            change_pct = realtime.get("change_pct") or realtime.get("change_60d")
-            
-            # 也尝试从 realtime_quote_raw 获取
-            if current_price is None:
-                realtime_quote_raw = context_snapshot.get("realtime_quote_raw") or {}
-                current_price = realtime_quote_raw.get("price")
-                change_pct = change_pct or realtime_quote_raw.get("change_pct") or realtime_quote_raw.get("pct_chg")
+        realtime_fields = extract_realtime_detail_fields(context_snapshot)
+        current_price = realtime_fields.get("current_price")
+        change_pct = realtime_fields.get("change_pct")
         
+        raw_result = result.get("raw_result")
+        if not isinstance(raw_result, dict):
+            raw_result = {}
+        report_language = normalize_report_language(
+            result.get("report_language")
+            or raw_result.get("report_language")
+            or (
+                context_snapshot.get("report_language")
+                if isinstance(context_snapshot, dict)
+                else None
+            )
+        )
+        stock_name = get_localized_stock_name(
+            result.get("stock_name"),
+            result.get("stock_code", ""),
+            report_language,
+        )
+
         # 构建响应模型
         meta = ReportMeta(
             id=result.get("id"),
             query_id=result.get("query_id", ""),
             stock_code=result.get("stock_code", ""),
-            stock_name=result.get("stock_name"),
+            stock_name=stock_name,
             report_type=result.get("report_type"),
+            report_language=report_language,
             created_at=result.get("created_at"),
             current_price=current_price,
             change_pct=change_pct,
@@ -241,10 +264,20 @@ def get_history_detail(
         
         summary = ReportSummary(
             analysis_summary=result.get("analysis_summary"),
-            operation_advice=result.get("operation_advice"),
-            trend_prediction=result.get("trend_prediction"),
+            operation_advice=localize_operation_advice(
+                result.get("operation_advice"),
+                report_language,
+            ),
+            trend_prediction=localize_trend_prediction(
+                result.get("trend_prediction"),
+                report_language,
+            ),
             sentiment_score=result.get("sentiment_score"),
-            sentiment_label=result.get("sentiment_label")
+            sentiment_label=(
+                get_sentiment_label(result.get("sentiment_score"), report_language)
+                if result.get("sentiment_score") is not None
+                else result.get("sentiment_label")
+            )
         )
         
         strategy = ReportStrategy(
@@ -262,6 +295,10 @@ def get_history_detail(
             context_snapshot=result.get("context_snapshot"),
             fallback_fundamental_payload=fallback_fundamental,
         )
+        extracted_boards = extract_board_detail_fields(
+            context_snapshot=result.get("context_snapshot"),
+            fallback_fundamental_payload=fallback_fundamental,
+        )
 
         details = ReportDetails(
             news_content=result.get("news_content"),
@@ -269,6 +306,8 @@ def get_history_detail(
             context_snapshot=result.get("context_snapshot"),
             financial_report=extracted_fundamental.get("financial_report"),
             dividend_metrics=extracted_fundamental.get("dividend_metrics"),
+            belong_boards=extracted_boards.get("belong_boards"),
+            sector_rankings=extracted_boards.get("sector_rankings"),
         )
         
         return AnalysisReport(
@@ -288,6 +327,49 @@ def get_history_detail(
                 "error": "internal_error",
                 "message": f"查询历史详情失败: {str(e)}"
             }
+        )
+
+
+@router.get(
+    "/{record_id}/diagnostics",
+    response_model=RunDiagnosticSummaryResponse,
+    responses={
+        200: {"description": "运行诊断摘要"},
+        404: {"description": "报告不存在", "model": ErrorResponse},
+        500: {"description": "服务器错误", "model": ErrorResponse},
+    },
+    summary="获取历史报告运行诊断摘要",
+    description="根据分析历史记录 ID 或 query_id 获取用户可读诊断摘要和脱敏复制文本。",
+)
+def get_history_diagnostics(
+    record_id: str,
+    db_manager: DatabaseManager = Depends(get_database_manager),
+) -> RunDiagnosticSummaryResponse:
+    """
+    获取历史报告运行诊断摘要。
+    """
+    try:
+        service = HistoryService(db_manager)
+        summary = service.resolve_and_get_diagnostics(record_id)
+        if summary is None:
+            raise HTTPException(
+                status_code=404,
+                detail={
+                    "error": "not_found",
+                    "message": f"未找到 id/query_id={record_id} 的分析记录",
+                },
+            )
+        return RunDiagnosticSummaryResponse.model_validate(summary)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"查询运行诊断摘要失败: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": "internal_error",
+                "message": f"查询运行诊断摘要失败: {str(e)}",
+            },
         )
 
 

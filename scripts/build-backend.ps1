@@ -15,6 +15,12 @@ if ([string]::IsNullOrWhiteSpace($pythonBin)) {
 
 Write-Host "Using Python: $pythonBin"
 
+Write-Host 'Verifying static asset references (source)...'
+& $pythonBin "${PSScriptRoot}\check_static_assets.py" 'static'
+if ($LASTEXITCODE -ne 0) {
+  throw "Static asset sanity check failed for source static/. See GitHub #1064."
+}
+
 function Test-PythonCode {
   param(
     [string]$Python,
@@ -36,6 +42,9 @@ if (-not (Test-PythonCode -Python $pythonBin -Code "import PyInstaller")) {
 
 Write-Host 'Installing backend dependencies...'
 & $pythonBin -m pip install -r requirements.txt
+if ($LASTEXITCODE -ne 0) {
+  throw "pip install -r requirements.txt failed with exit code $LASTEXITCODE."
+}
 
 Write-Host 'Checking python-multipart availability...'
 if (-not (Test-PythonCode -Python $pythonBin -Code "import multipart, multipart.multipart")) {
@@ -103,6 +112,7 @@ $pyInstallerArgs = @(
   '--noconfirm',
   '--noconsole',
   '--add-data', 'static;static',
+  '--add-data', 'strategies;strategies',
   '--collect-data', 'litellm',
   '--collect-data', 'tiktoken'
 )
@@ -120,5 +130,33 @@ if (!(Test-Path 'dist\stock_analysis')) {
 }
 
 Copy-Item -Path 'dist\stock_analysis' -Destination 'dist\backend\stock_analysis' -Recurse -Force
+
+Write-Host 'Verifying static asset references (packaged)...'
+$packagedStatic = Join-Path 'dist\backend\stock_analysis' '_internal\static'
+if (-not (Test-Path $packagedStatic)) {
+  $packagedStatic = Join-Path 'dist\backend\stock_analysis' 'static'
+}
+if (Test-Path $packagedStatic) {
+  & $pythonBin "${PSScriptRoot}\check_static_assets.py" $packagedStatic
+  if ($LASTEXITCODE -ne 0) {
+    throw "Static asset sanity check failed for packaged $packagedStatic. See GitHub #1064."
+  }
+} else {
+  Write-Warning "Could not locate packaged static directory under dist\backend\stock_analysis; skipping post-package check."
+}
+
+Write-Host 'Verifying packaged built-in strategies...'
+$sourceStrategyCount = @(Get-ChildItem -Path 'strategies' -Filter '*.yaml' -File).Count
+$packagedStrategies = Join-Path 'dist\backend\stock_analysis' '_internal\strategies'
+if (-not (Test-Path $packagedStrategies)) {
+  $packagedStrategies = Join-Path 'dist\backend\stock_analysis' 'strategies'
+}
+if (-not (Test-Path $packagedStrategies)) {
+  throw 'Packaged strategies directory not found under dist\backend\stock_analysis.'
+}
+$packagedStrategyCount = @(Get-ChildItem -Path $packagedStrategies -Filter '*.yaml' -File).Count
+if ($packagedStrategyCount -ne $sourceStrategyCount) {
+  throw "Packaged strategies count mismatch: expected $sourceStrategyCount, got $packagedStrategyCount."
+}
 
 Write-Host 'Backend build completed.'
